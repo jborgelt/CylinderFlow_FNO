@@ -1,0 +1,9 @@
+build/
+*.o
+*.a
+*~
+\#*\#
+.\#*
+# local OpenFOAM data lives outside the repo (e.g. symlink data -> ~/openfoam);
+# not committed because the path is machine-specific. Documented in README.
+/data
