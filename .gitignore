@@ -1,4 +1,7 @@
 build/
+weights/
+prediction/
+out/
 *.o
 *.a
 *~

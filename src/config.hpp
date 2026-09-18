@@ -12,13 +12,32 @@ struct Config {
   int fno_width = 32, fno_layers = 4, fno_modes = 12;
   int fno_channelIn = 5, fno_channelOut = 3;
   int q_hidden = 128;
+  int p_layers = 1, q_layers = 2;  // P/Q stack depths (forward loops them)
   // Data: case dir + default probe window.
   std::string dataDir = "data/run/2D_cylinder";
   double startProbeTime = 28, endProbeTime = 40, startProbeInterval = 2;
   // Uniform grid for the FFT + analytic cylinder (snappyHexMesh cutout).
   int nx = 64, ny = 64;
   double xmin = 0, xmax = 10, ymin = 0, ymax = 10;
-  double cylinder_x = 3, cylinder_y = 5, cylinder_r = 1;};
+  double cylinder_x = 3, cylinder_y = 5, cylinder_r = 1;
+  // Model weights: loaded after init when non-empty ("try to load").
+  // Missing file -> warning, keep current init. weight_precision:
+  // "float64" (bit-exact) or "float32" (half size, casts on save).
+  std::string weight_file;
+  std::string weight_precision = "float64";
+  // Predict: input snapshot time from the data run (CLI still overrides).
+  double predictionStartTimestep = 28;
+  // Predict: where to write the predicted field ("" = don't write).
+  std::string prediction_file;
+  // Predict: VTK twin for ParaView ("" = don't write).
+  std::string prediction_vtk;
+  // Rollout: time advanced per step (snapshot spacing), number of steps,
+  // VTK written every outputInterval-th step and always for the last step.
+  // nSteps = 1 is a single prediction (no separate single/multi commands).
+  double dt = 2.0;
+  int nSteps = 1;
+  int outputInterval = 1;
+};
 
 Config loadConfig(const std::string &path);
 

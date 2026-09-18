@@ -6,6 +6,15 @@
 #include <sstream>
 #include <stdexcept>
 
+// This file bridges two worlds:
+//   1. OpenFOAM's unstructured mesh (47k points, 102k faces, 28k cells living
+//      in constant/polyMesh/) -> per-cell center coordinates.
+//   2. Those cell centers + a field snapshot -> a uniform nx*ny grid tensor
+//      the FNO can FFT (plus helper tensors: cylinder mask, coords).
+// Only the four small helpers below parse mesh files; everything else works
+// on plain vectors. All mesh files here are ascii (see the "format ascii"
+// line in their FoamFile header); binary files would need a separate reader.
+
 // ---------------------------------------------------------------------------
 // Minimal OpenFOAM mesh-file helpers (ascii only).
 // A mesh file = FoamFile header, then a lone count line, then a (...) list.
@@ -15,6 +24,7 @@
 // ---------------------------------------------------------------------------
 
 static std::string trim(const std::string& s) {
+  // Strip leading/trailing blanks (incl. \r from Windows-style line ends).
   size_t a = s.find_first_not_of(" \t\r");
   if (a == std::string::npos) return "";
   size_t b = s.find_last_not_of(" \t\r");
@@ -22,13 +32,18 @@ static std::string trim(const std::string& s) {
 }
 
 static bool isDigits(const std::string& s) {
+  // True for lines like "47008", i.e. the element-count line that follows
+  // every FoamFile header. The header itself never has a digits-only line,
+  // which is what makes splitCountBody's detection reliable.
   if (s.empty()) return false;
   for (char c : s)
     if (c < '0' || c > '9') return false;
   return true;
 }
 
-// Split file into: count (first lone-number line) + body (everything after).
+// Split a mesh file into its element count and the raw "(...)" list body.
+// Layout on disk: FoamFile header block, then e.g. "102464", then the list.
+// Returns {count, body-after-the-count-line}.
 static std::pair<long, std::string> splitCountBody(const std::string& file) {
   std::ifstream f(file);
   if (!f) throw std::runtime_error("cannot open " + file);
@@ -50,6 +65,10 @@ static std::pair<long, std::string> splitCountBody(const std::string& file) {
 }
 
 static std::vector<std::string> tokenize(const std::string& body) {
+  // Flatten the list body into whitespace-separated tokens. Parens become
+  // standalone tokens so glued forms like "4(1 102 9998 9897)" parse the same
+  // as "4 ( 1 102 9998 9897 )". Callers then walk the token stream with an
+  // index instead of fragile line-based parsing (faces may wrap lines).
   std::string spaced;
   spaced.reserve(body.size() * 2);
   for (char c : body) {
@@ -69,10 +88,12 @@ static std::vector<std::string> tokenize(const std::string& body) {
 }
 
 struct Point3 {
-  double x, y, z;
+  double x, y, z;  // one mesh vertex; z is ~constant (2D case, one cell deep)
 };
 
 static std::vector<Point3> readPoints(const std::string& file) {
+  // points file: count N, then N lines "(x y z)". Point i is referenced by
+  // index i from the faces file, so order matters and is preserved.
   auto [count, body] = splitCountBody(file);
   auto toks = tokenize(body);
   std::vector<Point3> pts;
@@ -91,6 +112,9 @@ static std::vector<Point3> readPoints(const std::string& file) {
 }
 
 static std::vector<std::vector<int>> readFaces(const std::string& file) {
+  // faces file: count M, then M entries "k(p0 p1 ... pk-1)" where k is the
+  // corner count (usually 4 = quad) and pi are indices into the points list.
+  // Face fi sits between owner[fi] and, for internal faces, neighbour[fi].
   auto [count, body] = splitCountBody(file);
   auto toks = tokenize(body);
   std::vector<std::vector<int>> faces;
@@ -110,6 +134,9 @@ static std::vector<std::vector<int>> readFaces(const std::string& file) {
 }
 
 static std::vector<int> readLabels(const std::string& file) {
+  // owner/neighbour files: plain label lists, one entry per face.
+  // owner has one entry per face (all 102464); neighbour only covers the
+  // internal faces (first 71938) -- boundary faces have no neighbour cell.
   auto [count, body] = splitCountBody(file);
   auto toks = tokenize(body);
   std::vector<int> labels;
@@ -134,10 +161,15 @@ UniformGrid::UniformGrid(int nx, int ny, double xmin, double xmax, double ymin,
       cylY_(cylY),
       cylR_(cylR) {}
 
-Tensor3 UniformGrid::resample(const Snapshot& s, const CellCenters& centers) {
+Tensor3 UniformGrid::createData(const Snapshot& s, const CellCenters& centers) {
+  // Bin every unstructured cell into its uniform-grid cell by center position
+  // (nearest cell, indices clamped at the domain edge) and average when
+  // several cells land in one grid cell (refined mesh -> 28k cells onto 4k).
+  // Output channels are fixed physics: 0=ux, 1=uy, 2=p. Cells never hit stay
+  // 0; the cylinder hole is handled downstream via mask(), not here.
   if ((size_t)s.nCells != centers.x.size() || s.nCells == 0)
     throw std::runtime_error(
-        "resample: need cell centers matching the snapshot "
+        "createData: need cell centers matching the snapshot "
         "(call loadCellCenters first)");
   Tensor3 out;
   out.C = 3;
@@ -173,6 +205,9 @@ Tensor3 UniformGrid::resample(const Snapshot& s, const CellCenters& centers) {
 }
 
 Tensor3 UniformGrid::mask() const {
+  // 1 = fluid, 0 = inside the snappyHexMesh cylinder cutout (center/radius
+  // from the ctor, i.e. from properties.toml). Used to blank the hole in
+  // ParaView (Threshold/Clip) and later for masked losses.
   Tensor3 m;
   m.C = 1;
   m.Ny = ny_;
@@ -192,6 +227,9 @@ Tensor3 UniformGrid::mask() const {
 }
 
 Tensor3 UniformGrid::coords() const {
+  // Normalized (x,y) position channels in [0,1], appended to the model input
+  // (Li et al. Sec. 5.3 feeds coords alongside the fields so the operator
+  // knows where it is). Degenerate 1-wide dims map to 0.
   Tensor3 c;
   c.C = 2;
   c.Ny = ny_;
@@ -206,6 +244,10 @@ Tensor3 UniformGrid::coords() const {
 }
 
 CellCenters loadCellCenters(const std::string& caseDir) {
+  // Cell centers are NOT stored in polyMesh; rebuild them as the average of
+  // adjacent face centers. Each face contributes its centroid to its owner
+  // cell, and additionally to its neighbour cell if internal (face index <
+  // neighbour.size()). nCells is derived as max label + 1 over both lists.
   const std::string pm = caseDir + "/constant/polyMesh/";
   auto points = readPoints(pm + "points");
   auto faces = readFaces(pm + "faces");

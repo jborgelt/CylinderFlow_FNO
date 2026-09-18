@@ -1,5 +1,5 @@
 #pragma once
-// UniformGrid: resample unstructured OpenFOAM cells -> uniform Nx*Ny tensor
+// UniformGrid: create uniform Nx*Ny tensor data from unstructured OpenFOAM cells
 // for the FFT in the FNO (Li et al. 2021, Sec. 4 assumes uniform grid).
 // Layout: Tensor3 { C, Ny, Nx }, row-major, channel-first:
 //   ch 0 = ux, ch 1 = uy, ch 2 = p (+ optional x,y coords appended by FNO).
@@ -28,9 +28,10 @@ class UniformGrid {
               double ymin = 0, double ymax = 10, double cylX = 3,
               double cylY = 5, double cylR = 1);
 
-  // Nearest-neighbor resample of one snapshot onto the uniform grid.
+  // Create uniform-grid data from one snapshot: bins unstructured cells
+  // by center into grid cells (nearest-cell, averaging collisions).
   // centers: cell-center coords matching snapshot ordering.
-  Tensor3 resample(const Snapshot& s, const CellCenters& centers);
+  Tensor3 createData(const Snapshot& s, const CellCenters& centers);
 
   // 1 inside fluid, 0 inside cylinder/solid (for masked loss later).
   // Cylinder comes from the ctor (defaults: snappyHexMeshDict
@@ -42,6 +43,17 @@ class UniformGrid {
 
   int nx() const { return nx_; }
   int ny() const { return ny_; }
+  double xmin() const { return xmin_; }
+  double xmax() const { return xmax_; }
+  double ymin() const { return ymin_; }
+  double ymax() const { return ymax_; }
+  // Physical coords of a grid cell center.
+  double cellX(int ix) const {
+    return xmin_ + (ix + 0.5) * (xmax_ - xmin_) / nx_;
+  }
+  double cellY(int iy) const {
+    return ymin_ + (iy + 0.5) * (ymax_ - ymin_) / ny_;
+  }
 
  private:
   int nx_, ny_;

@@ -74,8 +74,8 @@ std::vector<Sample> buildDataset(FoamReader& reader, UniformGrid& grid,
                   times[k], times[k + 1]);
       continue;
     }
-    Tensor3 gx = grid.resample(sx, centers);
-    Tensor3 gy = grid.resample(sy, centers);
+    Tensor3 gx = grid.createData(sx, centers);
+    Tensor3 gy = grid.createData(sy, centers);
     Sample s;
     s.tIn = times[k];
     s.tOut = times[k + 1];

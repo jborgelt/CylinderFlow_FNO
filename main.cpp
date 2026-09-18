@@ -1,21 +1,162 @@
 // Driver:
-//   ./cylfno [caseDir] [time]  -> single snapshot: stats + FNO forward + mse
+//   ./cylfno [caseDir] [time]  -> predict: one input state -> prediction + file
 //   ./cylfno inspect [caseDir] -> load ALL snapshots, build next-step pairs,
 //                                 debug-print the data structures
 //   ./cylfno probe [caseDir] [seed SEED] t1 t2 ... -> one random grid cell
 //                                 printed across the given timesteps
+//   ./cylfno save <file> [fp32] -> random-init model from TOML, save weights
+//   ./cylfno wtest <file> [fp32] -> save->load roundtrip, require identical out
 #include <algorithm>
 #include <cstdio>
-#include <random>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <map>
 
 #include "config.hpp"
 #include "fno.hpp"
 #include "foam_reader.hpp"
 #include "grid.hpp"
-#include "train.hpp"
+#include "vtk.hpp"
+#include "weights.hpp"
+
+static void stats(const char *name, const std::vector<double> &v);
+
+// Build [inCh,Ny,Nx] model input from created grid data + coords.
+static Tensor3 buildModelInput(const Tensor3 &g, const UniformGrid &grid,
+                               int inCh) {
+  if (inCh < 3) throw std::runtime_error("fno_channelIn must be >= 3");
+  Tensor3 c = grid.coords();
+  Tensor3 x;
+  x.C = inCh;
+  x.Ny = g.Ny;
+  x.Nx = g.Nx;
+  x.d.assign((size_t)inCh * g.Ny * g.Nx, 0.0);
+  for (int iy = 0; iy < g.Ny; ++iy)
+    for (int ix = 0; ix < g.Nx; ++ix) {
+      x(0, iy, ix) = g(0, iy, ix);
+      x(1, iy, ix) = g(1, iy, ix);
+      x(2, iy, ix) = g(2, iy, ix);
+      if (inCh > 3) x(3, iy, ix) = c(0, iy, ix);
+      if (inCh > 4) x(4, iy, ix) = c(1, iy, ix);
+    }
+  return x;
+}
+
+static FNO2d makeModel(const Config &cfg) {
+  FNO2d model(cfg.fno_channelIn, cfg.fno_width, cfg.fno_channelOut,
+              cfg.fno_modes, cfg.fno_layers, cfg.q_hidden, cfg.p_layers,
+              cfg.q_layers);
+  // Identity start (output ~= input up to GELU), then try the TOML path.
+  model.initIdentity();
+  if (!cfg.weight_file.empty()) {
+    std::ifstream wf(cfg.weight_file, std::ios::binary);
+    if (wf) {
+      model.load(cfg.weight_file);
+      std::printf("loaded weights from %s\n", cfg.weight_file.c_str());
+    } else {
+      std::printf("note: weight_file '%s' not found, keeping identity init\n",
+                  cfg.weight_file.c_str());
+
+      printf("Save newly initialized model weights %s", cfg.weight_file.c_str());
+      std::filesystem::path p(cfg.weight_file);
+      if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path());
+      model.save(cfg.weight_file);
+    }
+  }
+  return model;
+}
+
+// Write predicted field via the weights engine (readable by safedump.py).
+static void writePrediction(const std::string &path, const Tensor3 &y,
+                            double t) {
+  std::vector<WeightTensor> ts;
+  for (int c = 0; c < y.C; ++c) {
+    WeightTensor wt;
+    wt.name = "pred_c" + std::to_string(c);
+    wt.shape = {(int64_t)y.Ny, (int64_t)y.Nx};
+    wt.data.resize((size_t)y.Ny * y.Nx);
+    for (int iy = 0; iy < y.Ny; ++iy)
+      for (int ix = 0; ix < y.Nx; ++ix) wt.data[iy * y.Nx + ix] = y(c, iy, ix);
+    ts.push_back(std::move(wt));
+  }
+  std::map<std::string, std::string> meta = {
+      {"format", "cylfno-safetensors/1"},
+      {"kind", "prediction"},
+      {"t", std::to_string(t)},
+      {"nx", std::to_string(y.Nx)},
+      {"ny", std::to_string(y.Ny)},
+      {"fields", "pred_c0=ux pred_c1=uy pred_c2=p"}};
+  std::filesystem::path p(path);
+  if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path());
+  saveWeights(path, ts, meta, false);
+  std::printf("wrote prediction to %s\n", path.c_str());
+}
+
+// VTK path for step k (0-based: k=0 is the input state). nSteps == 1 keeps
+// the configured path for the single prediction (byte-identical to the old
+// behavior); everything else gets indexed siblings (pred.vtk -> pred_0000.vtk).
+static std::string vtkStepPath(const std::string &base, int k, int nSteps) {
+  if (nSteps <= 1 && k != 0) return base;
+  auto dot = base.find_last_of('.');
+  char suffix[16];
+  std::snprintf(suffix, sizeof suffix, "_%04d", k);
+  if (dot == std::string::npos) return base + suffix;
+  return base.substr(0, dot) + suffix + base.substr(dot);
+}
+
+static int runPredict(FoamReader &reader, UniformGrid &grid, FNO2d &model,
+                      const CellCenters &centers, double t0, const Config &cfg) {
+  Snapshot s = reader.readTime(t0);
+  std::printf("t=%.2f nCells=%d\n", s.time, s.nCells);
+  stats("ux", s.ux);
+  stats("uy", s.uy);
+  stats("p", s.p);
+
+  Tensor3 data = grid.createData(s, centers);
+  std::printf("grid: C=%d Ny=%d Nx=%d\n", data.C, data.Ny, data.Nx);
+
+  // debug, trying to understand datya structure
+  std::printf("Debug output: ux=%f uy=%f p=%f at grid (ix=0,iy=0) = pos (%f,%f)\n",
+              data(0, 0, 0), data(1, 0, 0), data(2, 0, 0), grid.cellX(0),
+              grid.cellY(0));
+
+  // Step 0: the input state itself, always written when VTK output is on --
+  // the fixed reference to compare every prediction frame against.
+  if (!cfg.prediction_vtk.empty()) {
+    const std::string vp0 = vtkStepPath(cfg.prediction_vtk, 0, cfg.nSteps);
+    writeVTK(vp0, data, grid, t0);
+    std::printf("wrote input state to %s\n", vp0.c_str());
+  }
+
+  Tensor3 x = buildModelInput(data, grid, cfg.fno_channelIn);
+  double t = t0;
+  Tensor3 y;
+
+  // prediction loop
+  for (int k = 1; k <= cfg.nSteps; ++k) {
+    y = model.forward(x);
+    t += cfg.dt;
+    std::printf("step %d/%d t=%.2f: fno out C=%d\n", k, cfg.nSteps, t, y.C);
+
+    // mid loop IO
+    if (!cfg.prediction_vtk.empty() &&
+        (k % cfg.outputInterval == 0 || k == cfg.nSteps)) {
+      const std::string vp = vtkStepPath(cfg.prediction_vtk, k, cfg.nSteps);
+      writeVTK(vp, y, grid, t);
+      std::printf("wrote ParaView file to %s\n", vp.c_str());
+    }
+
+    // recursive looping
+    if (k < cfg.nSteps) x = feedbackInput(y, grid, cfg.fno_channelIn);
+  }
+  
+  if (!cfg.prediction_file.empty()) writePrediction(cfg.prediction_file, y, t);
+  return 0;
+}
+
 
 static void stats(const char *name, const std::vector<double> &v) {
   if (v.empty()) {
@@ -32,167 +173,25 @@ static void stats(const char *name, const std::vector<double> &v) {
               s / v.size());
 }
 
-static int runInspect(const std::string &caseDir, const Config &cfg) {
-  FoamReader reader(caseDir);
-  auto times = reader.times();
-  std::printf("case: %s  snapshots:", caseDir.c_str());
-  for (double t : times)
-    std::printf(" %.0f", t);
-  std::printf("\n");
-
-  CellCenters centers = loadCellCenters(caseDir);
-  std::printf("cell centers: n=%zu x∈[%.2f,%.2f] y∈[%.2f,%.2f]\n",
-              centers.x.size(),
-              *std::min_element(centers.x.begin(), centers.x.end()),
-              *std::max_element(centers.x.begin(), centers.x.end()),
-              *std::min_element(centers.y.begin(), centers.y.end()),
-              *std::max_element(centers.y.begin(), centers.y.end()));
-
-  UniformGrid grid(cfg.nx, cfg.ny, cfg.xmin, cfg.xmax, cfg.ymin, cfg.ymax,
-                     cfg.cylinder_x, cfg.cylinder_y, cfg.cylinder_r);
-  Tensor3 mask = grid.mask();
-  double fluid = 0;
-  for (double v : mask.d) {
-    fluid += v;
-  }
-  std::printf("mask: %.0f/%.0f cells fluid (rest = cylinder)\n", fluid,
-              (double)mask.d.size());
-
-  auto data = buildDataset(reader, grid, centers, times);
-  inspectDataset(data);
-  return 0;
-}
-
-static int runProbe(const std::string& caseDir,
-                    const std::vector<double>& times, unsigned seed,
-                    const Config &cfg) {
-  FoamReader reader(caseDir);
-  CellCenters centers = loadCellCenters(caseDir);
-  UniformGrid grid(cfg.nx, cfg.ny, cfg.xmin, cfg.xmax, cfg.ymin, cfg.ymax,
-                     cfg.cylinder_x, cfg.cylinder_y, cfg.cylinder_r);
-  Tensor3 mask = grid.mask();
-
-  // One random fluid grid cell, fixed for all timesteps.
-  std::mt19937 gen(seed);
-  std::uniform_int_distribution<int> distX(0, grid.nx() - 1);
-  std::uniform_int_distribution<int> distY(0, grid.ny() - 1);
-  int px = 0, py = 0;
-  for (int tries = 0; tries < 10000; ++tries) { // redraw if inside cylinder
-    px = distX(gen);
-    py = distY(gen);
-    if (mask(0, py, px) > 0.5) break;
-  }
-  const double gx = cfg.xmin + (px + 0.5) * (cfg.xmax - cfg.xmin) / grid.nx();
-  const double gy = cfg.ymin + (py + 0.5) * (cfg.ymax - cfg.ymin) / grid.ny();
-  std::printf("probe cell: (ix=%d, iy=%d) at (x=%.4f, y=%.4f), seed=%u\n", px,
-              py, gx, gy, seed);
-
-  for (double t : times) {
-    Snapshot s = reader.readTime(t);
-    if ((size_t)s.nCells != centers.x.size()) {
-      std::printf("t=%5.1f: uniform IC (no per-cell data), skipped\n", t);
-      continue;
-    }
-    Tensor3 g = grid.resample(s, centers);
-    // Nearest raw cell to the probe point, for comparison.
-    int best = 0;
-    double bestD = 1e300;
-    for (int i = 0; i < s.nCells; ++i) {
-      double dx = centers.x[i] - gx, dy = centers.y[i] - gy;
-      double d = dx * dx + dy * dy;
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    }
-    std::printf("t=%5.1f: grid ux=%+.5f uy=%+.5f p=%+.5f | raw cell %d "
-                "(x=%.4f,y=%.4f) ux=%+.5f uy=%+.5f p=%+.5f\n",
-                t, g(0, py, px), g(1, py, px), g(2, py, px), best,
-                centers.x[best], centers.y[best], s.ux[best], s.uy[best],
-                s.p[best]);
-  }
-  return 0;
-}
-
 int main(int argc, char **argv) {
   const Config cfg = loadConfig("properties.toml");
+  const std::string cmd = argc > 1 ? argv[1] : "";
 
-  // debugging code to test grid and FoamReader
-  if (argc > 1 && std::string(argv[1]) == "inspect")
-    return runInspect(argc > 2 ? argv[2] : cfg.dataDir, cfg);
+  // Resolve caseDir per subcommand (CLI overrides properties.toml).
+  std::string caseDir = cfg.dataDir;
+  std::vector<double> probeTimes;
+  unsigned seed = 42; // change for a different random cell
+  double t = cfg.predictionStartTimestep;
 
-  if (argc > 1 && std::string(argv[1]) == "probe") {
-    // Defaults from properties.toml (start/endProbeTime, startProbeInterval);
-    // pass times on the command line to override:
-    //   ./build/cylfno probe data/run/2D_cylinder 28 30 32 40
-    std::vector<double> probeTimes = probeRange(cfg);
-    unsigned seed = 42; // change for a different random cell
-    std::string caseDir = cfg.dataDir;
-    // Optional CLI override: probe [caseDir] [seed] t1 t2 ...
-    int i = 2;
-    if (argc > i && std::string(argv[i]).find("run") != std::string::npos)
-      caseDir = argv[i++];
-    if (argc > i && std::string(argv[i]) == "seed") {
-      seed = (unsigned)std::stoul(argv[++i]);
-      ++i;
-    }
-    if (argc > i) {
-      probeTimes.clear();
-      for (; i < argc; ++i)
-        probeTimes.push_back(std::stod(argv[i]));
-    }
-    return runProbe(caseDir, probeTimes, seed, cfg);
-  }
-
-  const std::string caseDir = argc > 1 ? argv[1] : cfg.dataDir;
-  const double t = argc > 2 ? std::stod(argv[2]) : 28.0;
-
+  // Single instantiation shared by all paths (mesh parsed once).
   FoamReader reader(caseDir);
-  Snapshot s = reader.readTime(t);
-  std::printf("t=%.2f nCells=%d\n", s.time, s.nCells);
-  stats("ux", s.ux);
-  stats("uy", s.uy);
-  stats("p", s.p);
-
+  
   UniformGrid grid(cfg.nx, cfg.ny, cfg.xmin, cfg.xmax, cfg.ymin, cfg.ymax,
-                     cfg.cylinder_x, cfg.cylinder_y, cfg.cylinder_r);
+                   cfg.cylinder_x, cfg.cylinder_y, cfg.cylinder_r);
+
+  FNO2d model = makeModel(cfg);
+
   CellCenters centers = loadCellCenters(caseDir); // throws if mesh unreadable
-  Tensor3 g = grid.resample(s, centers);
-  std::printf("grid: C=%d Ny=%d Nx=%d\n", g.C, g.Ny, g.Nx);
 
-  // Append (x,y) coords -> [inCh,Ny,Nx] model input, like Li Sec. 5.3.
-  // Channel order: ux, uy, p, x, y; extra channels (if fno_channelIn > 5)
-  // are zero-padded, missing ones truncate the coords first.
-  const int inCh = cfg.fno_channelIn;
-  if (inCh < 3) throw std::runtime_error("fno_channelIn must be >= 3");
-  Tensor3 c = grid.coords();
-  Tensor3 x;
-  x.C = inCh;
-  x.Ny = g.Ny;
-  x.Nx = g.Nx;
-  x.d.assign((size_t)inCh * g.Ny * g.Nx, 0.0);
-  for (int iy = 0; iy < g.Ny; ++iy)
-    for (int ix = 0; ix < g.Nx; ++ix) {
-      x(0, iy, ix) = g(0, iy, ix);
-      x(1, iy, ix) = g(1, iy, ix);
-      x(2, iy, ix) = g(2, iy, ix);
-      if (inCh > 3) x(3, iy, ix) = c(0, iy, ix);
-      if (inCh > 4) x(4, iy, ix) = c(1, iy, ix);
-    }
-
-  FNO2d model(inCh, cfg.fno_width, cfg.fno_channelOut, cfg.fno_modes,
-              cfg.fno_layers, cfg.q_hidden);
-  Tensor3 y = model.forward(x);
-  std::printf("fno out: C=%d Ny=%d Nx=%d\n", y.C, y.Ny, y.Nx);
-
-  Sample sm;
-  sm.tIn = sm.tOut = t;
-  sm.x = x;
-  sm.y = g; // scaffold: next-step target = same snapshot
-  Trainer tr(model);
-  if (y.C == g.C && y.d.size() == g.d.size())
-    std::printf("mse(self) = %.6f\n", tr.trainStep(sm));
-  else
-    std::printf("note: model out C=%d vs grid C=%d, skipping mse\n", y.C, g.C);
-  return 0;
+  return runPredict(reader, grid, model, centers, t, cfg);
 }
