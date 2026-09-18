@@ -123,8 +123,16 @@ static std::vector<int> readLabels(const std::string& file) {
 // ---------------------------------------------------------------------------
 
 UniformGrid::UniformGrid(int nx, int ny, double xmin, double xmax, double ymin,
-                         double ymax)
-    : nx_(nx), ny_(ny), xmin_(xmin), xmax_(xmax), ymin_(ymin), ymax_(ymax) {}
+                         double ymax, double cylX, double cylY, double cylR)
+    : nx_(nx),
+      ny_(ny),
+      xmin_(xmin),
+      xmax_(xmax),
+      ymin_(ymin),
+      ymax_(ymax),
+      cylX_(cylX),
+      cylY_(cylY),
+      cylR_(cylR) {}
 
 Tensor3 UniformGrid::resample(const Snapshot& s, const CellCenters& centers) {
   if ((size_t)s.nCells != centers.x.size() || s.nCells == 0)
@@ -164,11 +172,6 @@ Tensor3 UniformGrid::resample(const Snapshot& s, const CellCenters& centers) {
   return out;
 }
 
-namespace {
-// Cylinder cut out by snappyHexMesh: center (3,5), radius 1, axis z.
-constexpr double kCylX = 3.0, kCylY = 5.0, kCylR = 1.0;
-}  // namespace
-
 Tensor3 UniformGrid::mask() const {
   Tensor3 m;
   m.C = 1;
@@ -181,9 +184,9 @@ Tensor3 UniformGrid::mask() const {
     for (int ix = 0; ix < nx_; ++ix) {
       const double cx = xmin_ + (ix + 0.5) * dx;
       const double cy = ymin_ + (iy + 0.5) * dy;
-      const double dist =
-          std::sqrt((cx - kCylX) * (cx - kCylX) + (cy - kCylY) * (cy - kCylY));
-      if (dist < kCylR) m(0, iy, ix) = 0.0;
+      const double dist = std::sqrt((cx - cylX_) * (cx - cylX_) +
+                                    (cy - cylY_) * (cy - cylY_));
+      if (dist < cylR_) m(0, iy, ix) = 0.0;
     }
   return m;
 }

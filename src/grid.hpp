@@ -25,16 +25,16 @@ struct CellCenters {
 class UniformGrid {
  public:
   UniformGrid(int nx = 64, int ny = 64, double xmin = 0, double xmax = 10,
-              double ymin = 0, double ymax = 10);
+              double ymin = 0, double ymax = 10, double cylX = 3,
+              double cylY = 5, double cylR = 1);
 
   // Nearest-neighbor resample of one snapshot onto the uniform grid.
   // centers: cell-center coords matching snapshot ordering.
   Tensor3 resample(const Snapshot& s, const CellCenters& centers);
 
   // 1 inside fluid, 0 inside cylinder/solid (for masked loss later).
-  // Analytic cylinder: center (3,5), radius 1 — see
-  // system/snappyHexMeshDict `geometry { cylinder { ... } }`.
-  // TODO: parse the dict instead of hardcoding.
+  // Cylinder comes from the ctor (defaults: snappyHexMeshDict
+  // `geometry { cylinder { ... } }`: center (3,5), radius 1).
   Tensor3 mask() const;
 
   // Normalized (x,y) coordinate channels in [0,1], as in Li Sec. 5.3.
@@ -46,6 +46,7 @@ class UniformGrid {
  private:
   int nx_, ny_;
   double xmin_, xmax_, ymin_, ymax_;
+  double cylX_, cylY_, cylR_;
 };
 
 // Reads constant/polyMesh/{points,faces,owner,neighbour} and returns the

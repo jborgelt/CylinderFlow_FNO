@@ -33,14 +33,14 @@ struct SpectralConv2d {
 class FNO2d {
  public:
   FNO2d(int inCh = 5, int width = 32, int outCh = 3, int modes = 12,
-        int layers = 4);
+        int layers = 4, int qHidden = 128);
   // in: [inCh,Ny,Nx] = (ux,uy,p,x,y); out: [outCh,Ny,Nx] = next (ux,uy,p)
   Tensor3 forward(const Tensor3& a) const;
 
  private:
-  int inCh_, width_, outCh_, modes_, layers_;
+  int inCh_, width_, outCh_, modes_, layers_, qHidden_;
   Linear1x1 P_;
   std::vector<SpectralConv2d> L_;
-  Linear1x1 Q1_;  // width -> 128
-  Linear1x1 Q2_;  // 128 -> out
+  Linear1x1 Q1_;  // width -> qHidden
+  Linear1x1 Q2_;  // qHidden -> out
 };

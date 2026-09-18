@@ -12,6 +12,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 #   target_link_libraries(fno PUBLIC Eigen3::Eigen fftw3)
 
 add_library(fno
+  src/config.cpp
   src/foam_reader.cpp
   src/grid.cpp
   src/fno.cpp

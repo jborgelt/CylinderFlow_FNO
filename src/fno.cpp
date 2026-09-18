@@ -67,14 +67,19 @@ Tensor3 SpectralConv2d::forward(const Tensor3& v) const {
   return y;
 }
 
-FNO2d::FNO2d(int inCh, int width, int outCh, int modes, int layers)
-    : inCh_(inCh), width_(width), outCh_(outCh), modes_(modes),
-      layers_(layers) {
+FNO2d::FNO2d(int inCh, int width, int outCh, int modes, int layers,
+             int qHidden)
+    : inCh_(inCh),
+      width_(width),
+      outCh_(outCh),
+      modes_(modes),
+      layers_(layers),
+      qHidden_(qHidden) {
   P_.init(inCh_, width_, 1);
   L_.resize(layers_);
   for (int i = 0; i < layers_; ++i) L_[i].init(width_, modes_, modes_, 10 + i);
-  Q1_.init(width_, 128, 100);
-  Q2_.init(128, outCh_, 101);
+  Q1_.init(width_, qHidden_, 100);
+  Q2_.init(qHidden_, outCh_, 101);
 }
 
 Tensor3 FNO2d::forward(const Tensor3& a) const {
